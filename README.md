@@ -38,13 +38,12 @@ Based on the OpenFlight format specification and the original [blight-1.2](https
 ## Supported Blender Version
 
 Blender **5.0.1** and later (Python 3, bpy API 4.x / 5.x).
-Not compatible with Blender 2.x / 3.x due to API changes.
 
 ---
 
 ## Installation
 
-1. Download `io_import_flt.zip` from the [Releases](../../releases) page
+1. Download the ZIP: on the repository page click **Code → Download ZIP**
 2. In Blender: **Edit → Preferences → Add-ons → Install…**
 3. Select the downloaded `.zip` file
 4. Enable **Import-Export: OpenFlight FLT format**
