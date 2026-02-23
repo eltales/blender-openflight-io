@@ -546,7 +546,7 @@ class FltExporter:
         children = [o for o in self.objects if o.parent == obj]
         flt_type = obj.get('flt_type', '')
 
-        if obj.type == 'MESH':
+        if obj.type == 'MESH' or flt_type == 'OBJECT':
             self._write_object_node(w, obj, children)
         elif obj.type == 'LIGHT' or flt_type == 'LIGHTPOINT':
             self._write_light_point_node(w, obj, children)
@@ -561,26 +561,29 @@ class FltExporter:
 
     def _write_group_node(self, w, obj, children):
         name = obj.name[:8]
+        flags      = int(obj.get('flt_group_flags', 0))
+        loop_count = int(obj.get('flt_group_loop_count', 0))
+        loop_dur   = float(obj.get('flt_group_loop_duration', 0.0))
+        last_dur   = float(obj.get('flt_group_last_frame_duration', 0.0))
 
         # Group record (op=2, length=44)
         # Data layout: name(8)+priority(2)+reserved(2)+flags(4)+
         #              sID1(2)+sID2(2)+significance(2)+
-        #              layerCode(1)+reserved(1)+reserved(4)+
+        #              layerCode(1)+5×reserved+
         #              loopCount(4)+loopDur(4)+lastFrameDur(4) = 40 bytes
         w.rec(OP_GROUP, 44)
         w.string(name, 8)
-        w.short(0)     # relativePriority
-        w.ushort(0)    # reserved
-        w.uint(0)      # flags
-        w.short(0)     # specialID1
-        w.short(0)     # specialID2
-        w.short(0)     # significance
-        w.uchar(0)     # layerCode
-        w.uchar(0)     # reserved
-        w.uint(0)      # reserved
-        w.uint(0)      # loopCount
-        w.float_(0.0)  # loopDuration
-        w.float_(0.0)  # lastFrameDuration
+        w.short(0)          # relativePriority
+        w.ushort(0)         # reserved
+        w.uint(flags)       # flags (preserved from import)
+        w.short(0)          # specialID1
+        w.short(0)          # specialID2
+        w.short(0)          # significance
+        w.uchar(0)          # layerCode
+        w.zeros(5)          # 5 reserved bytes
+        w.int_(loop_count)  # loopCount
+        w.float_(loop_dur)  # loopDuration
+        w.float_(last_dur)  # lastFrameDuration
 
         # Always write LongID — FLT convention: every node gets a LongID
         # so that the full name is preserved on round-trip regardless of length.
@@ -600,18 +603,20 @@ class FltExporter:
             w.rec(OP_POP, 4)
 
     def _write_object_node(self, w, obj, children):
-        name = obj.name[:8]
+        name         = obj.name[:8]
+        flags        = int(obj.get('flt_object_flags', 0))
+        transparency = int(obj.get('flt_object_transparency', 0))
 
         # Object record (op=4, length=28)
         w.rec(OP_OBJECT, 28)
         w.string(name, 8)
-        w.uint(0)      # flags
-        w.short(0)     # relativePriority
-        w.ushort(0)    # transparency
-        w.short(0)     # specialEffectID1
-        w.short(0)     # specialEffectID2
-        w.short(0)     # significance
-        w.ushort(0)    # reserved
+        w.uint(flags)           # flags (preserved from import)
+        w.short(0)              # relativePriority
+        w.ushort(transparency)  # transparency (preserved from import)
+        w.short(0)              # specialEffectID1
+        w.short(0)              # specialEffectID2
+        w.short(0)              # significance
+        w.ushort(0)             # reserved
 
         # Always write LongID — FLT convention: every node gets a LongID
         self._write_long_id(w, obj.name)
@@ -741,19 +746,28 @@ class FltExporter:
           4  header
           8  id
           4  reserved
-          4  current_mask (uint32)
-          4  num_masks    (uint32)
+          4  current_mask     (uint32)
+          4  num_masks        (uint32)
           4  num_u32_per_mask (uint32)
           N  masks: num_masks × num_u32_per_mask × uint32
-        Total = 4 + 8+4+4+4+4 + N*4 = 28 + N*4 bytes
+        Total = 4 + 8+4+4+4+4 + N*4 bytes
         """
         name         = obj.name[:8]
         current_mask = int(obj.get('flt_current_mask', 0))
-        # Masks are not stored as a single custom prop; default to one mask = current
-        # A proper round-trip would need to store and restore the full mask array.
-        num_masks    = 1
-        n_per_mask   = 1
-        total_len    = 28 + num_masks * n_per_mask * 4  # = 32
+        num_masks    = int(obj.get('flt_switch_num_masks', 1))
+        n_per_mask   = int(obj.get('flt_switch_n_per_mask', 1))
+        raw_masks    = obj.get('flt_switch_masks', None)
+
+        # Build mask array from stored data or synthesize from current_mask
+        if raw_masks is not None and len(raw_masks) == num_masks * n_per_mask:
+            mask_values = [int(m) for m in raw_masks]
+        else:
+            # Fallback: one mask = current_mask (simplest valid Switch)
+            num_masks  = 1
+            n_per_mask = 1
+            mask_values = [current_mask]
+
+        total_len = 4 + 8 + 4 + 4 + 4 + 4 + len(mask_values) * 4
 
         w.rec(OP_SWITCH, total_len)
         w.string(name, 8)
@@ -761,7 +775,8 @@ class FltExporter:
         w.uint(current_mask)
         w.uint(num_masks)
         w.uint(n_per_mask)
-        w.uint(current_mask)  # the single mask value
+        for mv in mask_values:
+            w.uint(mv)
 
         self._write_long_id(w, obj.name)
 

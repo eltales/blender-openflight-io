@@ -97,6 +97,9 @@ class FltGroup(FltNode):
         self.node_type = 'GROUP'
         self.priority = 0
         self.flags = 0
+        self.loop_count = 0          # Group.cs: LoopCount (0 = loop forever)
+        self.loop_duration = 0.0     # Group.cs: LoopDuration (seconds)
+        self.last_frame_duration = 0.0  # Group.cs: LastFrameDuration (seconds)
 
 
 class FltObject(FltNode):
@@ -104,6 +107,8 @@ class FltObject(FltNode):
         super().__init__(name)
         self.node_type = 'OBJECT'
         self.flags = 0
+        self.priority = 0
+        self.transparency = 0        # Object.cs: 0=opaque, 65535=clear
         self.faces = []       # list[FltFaceData]
 
 
@@ -628,19 +633,52 @@ class FltDatabase:
         self.vert_offset_map[v.byte_offset] = len(self.vert_palette) - 1
 
     def _parse_group(self, reader):
+        """Parse Group (op=2, 44 bytes).
+
+        Group.cs layout (40 bytes data):
+          8  id
+          2  relativePriority
+          2  reserved
+          4  flags
+          2  specialEffectID1
+          2  specialEffectID2
+          2  significance
+          1  layerCode
+          5  reserved
+          4  loopCount   (int32)
+          4  loopDuration (float32)
+          4  lastFrameDuration (float32)
+        """
         name = reader.read_string(8)
         node = FltGroup(name)
         node.priority = reader.read_short()
         reader.read_ushort()             # reserved
         node.flags = reader.read_uint()
-        reader.skip(2 + 2 + 2 + 1 + 1 + 4)  # specialID1, specialID2, significance, layerCode, reserved, reserved
+        reader.skip(2 + 2 + 2 + 1 + 5)  # sEID1, sEID2, significance, layerCode, 5×reserved
+        node.loop_count          = reader.read_int()
+        node.loop_duration       = reader.read_float()
+        node.last_frame_duration = reader.read_float()
         return node
 
     def _parse_object_node(self, reader):
+        """Parse Object (op=4, 28 bytes).
+
+        Object.cs layout (24 bytes data):
+          8  id
+          4  flags
+          2  relativePriority
+          2  transparency (0=opaque, 65535=clear)
+          2  specialEffectID1
+          2  specialEffectID2
+          2  significance
+          2  reserved
+        """
         name = reader.read_string(8)
         node = FltObject(name)
-        node.flags = reader.read_uint()
-        reader.skip(2 + 2 + 2 + 2 + 2 + 2)  # priority, transparency, specialID1/2, significance, reserved
+        node.flags        = reader.read_uint()
+        node.priority     = reader.read_short()
+        node.transparency = reader.read_ushort()  # 0=opaque, 65535=clear
+        reader.skip(2 + 2 + 2 + 2)               # sEID1, sEID2, significance, reserved
         return node
 
     def _parse_lod(self, reader):

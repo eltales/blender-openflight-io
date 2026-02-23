@@ -130,8 +130,16 @@ class FltImporter:
         name = node.long_name or node.name or 'Object'
         all_faces = node.faces + getattr(node, '_implicit_faces', [])
         if all_faces:
-            return self._build_mesh_object(name, all_faces, collection, parent_obj)
-        return self._create_empty(name, collection, parent_obj)
+            obj = self._build_mesh_object(name, all_faces, collection, parent_obj)
+        else:
+            obj = self._create_empty(name, collection, parent_obj)
+        # Store FLT metadata for round-trip export
+        obj['flt_type'] = 'OBJECT'
+        if node.flags:
+            obj['flt_object_flags'] = int(node.flags)
+        if node.transparency:
+            obj['flt_object_transparency'] = int(node.transparency)
+        return obj
 
     # ── FltGroup ──────────────────────────────────────────────────────────────
 
@@ -139,8 +147,17 @@ class FltImporter:
         name = node.long_name or node.name or 'Group'
         implicit = getattr(node, '_implicit_faces', [])
         if implicit:
-            return self._build_mesh_object(name, implicit, collection, parent_obj)
-        return self._create_empty(name, collection, parent_obj)
+            obj = self._build_mesh_object(name, implicit, collection, parent_obj)
+        else:
+            obj = self._create_empty(name, collection, parent_obj)
+        # Store FLT metadata for round-trip export
+        if node.flags:
+            obj['flt_group_flags'] = int(node.flags)
+        if node.loop_count:
+            obj['flt_group_loop_count']          = int(node.loop_count)
+            obj['flt_group_loop_duration']       = float(node.loop_duration)
+            obj['flt_group_last_frame_duration'] = float(node.last_frame_duration)
+        return obj
 
     # ── FltLOD ────────────────────────────────────────────────────────────────
 
@@ -161,8 +178,13 @@ class FltImporter:
     def _import_switch(self, node, collection, parent_obj):
         name = node.long_name or node.name or 'Switch'
         obj = self._create_empty(name, collection, parent_obj)
-        obj['flt_type'] = 'SWITCH'
-        obj['flt_current_mask'] = node.current_mask
+        obj['flt_type']           = 'SWITCH'
+        obj['flt_current_mask']   = int(node.current_mask)
+        obj['flt_switch_num_masks']     = int(node.num_masks)
+        obj['flt_switch_n_per_mask']    = int(node.num_u32_per_mask)
+        # Store the full mask array as a flat list of ints for round-trip export
+        if node.masks:
+            obj['flt_switch_masks'] = [int(m) for m in node.masks]
         return obj
 
     # ── FltDOF ────────────────────────────────────────────────────────────────
