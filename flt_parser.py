@@ -260,6 +260,14 @@ class FltDatabase:
         Main parsing loop. Builds a tree of FltNodes using a parent stack.
         PUSH (op=10) descends into children of the last added node.
         POP  (op=11) returns to the previous parent.
+
+        Special handling for IDX_LP (op=130):
+        In FLT the structure is IDX_LP → (op=124) → LongID → PUSH → VERT_LIST → POP.
+        The PUSH/POP block is NOT a real children scope — it only carries the 3D
+        position (VERT_LIST).  To avoid the LightPoint node swallowing its
+        siblings as children, we do NOT set current_parent = LP node.
+        Instead we track the last-added LP in pending_lp_node and use it only for
+        LongID, Matrix, and VERT_LIST records that immediately follow.
         """
         parent_stack = []       # stack of parent FltNode references
         current_parent = None   # active parent (None = top level)
@@ -270,6 +278,10 @@ class FltDatabase:
 
         # Active mesh node (for LocalVertexPool and MeshPrimitive records)
         current_mesh = None
+
+        # Last-added IDX_LP / OP_LIGHT_POINT node waiting for its VERT_LIST.
+        # Cleared when any new scene-graph node is encountered.
+        pending_lp_node = None
 
         def add_child(node):
             if current_parent is not None:
@@ -321,22 +333,26 @@ class FltDatabase:
             # ── Node attribute records (applied to current_parent) ────────
             if op == OP_LONG_ID:
                 name = reader.read_string(reader.length - 4)
-                if current_parent is not None:
-                    current_parent.long_name = name
-                    if not current_parent.name:
-                        current_parent.name = name
+                # Apply to pending LP node first (it does not own current_parent)
+                target = pending_lp_node if pending_lp_node is not None else current_parent
+                if target is not None:
+                    target.long_name = name
+                    if not target.name:
+                        target.name = name
                 continue
 
             if op == OP_COMMENT:
                 comment = reader.read_string(reader.length - 4)
-                if current_parent is not None:
-                    current_parent.comment = comment
+                target = pending_lp_node if pending_lp_node is not None else current_parent
+                if target is not None:
+                    target.comment = comment
                 continue
 
             if op == OP_MATRIX:
                 mat = reader.read_matrix4x4()
-                if current_parent is not None:
-                    current_parent.matrix = mat
+                target = pending_lp_node if pending_lp_node is not None else current_parent
+                if target is not None:
+                    target.matrix = mat
                 continue
 
             # ── Palette records ───────────────────────────────────────────
@@ -371,42 +387,49 @@ class FltDatabase:
 
             # ── Scene graph nodes ─────────────────────────────────────────
             if op == OP_GROUP:
+                pending_lp_node = None
                 node = self._parse_group(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_OBJECT:
+                pending_lp_node = None
                 node = self._parse_object_node(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_LOD:
+                pending_lp_node = None
                 node = self._parse_lod(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_SWITCH:
+                pending_lp_node = None
                 node = self._parse_switch(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_DOF:
+                pending_lp_node = None
                 node = self._parse_dof(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_EXTERNAL_REF:
+                pending_lp_node = None
                 node = self._parse_external_ref(reader)
                 add_child(node)
                 current_parent = node
                 continue
 
             if op == OP_MESH:
+                pending_lp_node = None
                 node = self._parse_mesh_node(reader)
                 add_child(node)
                 current_parent = node
@@ -436,7 +459,8 @@ class FltDatabase:
                 continue
 
             if op == OP_VERTEX_LIST:
-                self._parse_vertex_list(reader, current_parent)
+                self._parse_vertex_list(reader, current_parent, pending_lp_node)
+                pending_lp_node = None   # consumed
                 continue
 
             if op in (OP_LIGHT_POINT, OP_INDEXED_LP, OP_LIGHTPT_SYSTEM):
@@ -448,7 +472,11 @@ class FltDatabase:
                     node.draw_order = reader.read_short()
                     node.lp_flags   = reader.read_ushort()
                 add_child(node)
-                current_parent = node
+                # Do NOT change current_parent — IDX_LP's PUSH/POP block only
+                # carries the VERT_LIST position, not real scene-graph children.
+                # Setting current_parent = LP would cause subsequent sibling
+                # nodes (groups etc.) to be incorrectly parented under the LP.
+                pending_lp_node = node
                 continue
 
             if op == OP_LIGHTPT_APP_PAL:
@@ -784,21 +812,28 @@ class FltDatabase:
 
         return face
 
-    def _parse_vertex_list(self, reader, current_parent):
+    def _parse_vertex_list(self, reader, current_parent, pending_lp_node=None):
         """Read a list of byte offsets and resolve them to vertex palette indices.
-        Assigns the resulting indices to the last face in current_parent."""
+        Assigns the resulting indices to the last face in current_parent.
+
+        pending_lp_node: the IDX_LP that owns this VERT_LIST (its 3D position).
+        Because IDX_LP does not set current_parent, the LP is tracked separately.
+        """
         num = (reader.length - 4) // 4
         offsets = [reader.read_int() for _ in range(num)]
 
         # Light point: vertex list defines the 3D position of the light.
         # In FLT the structure is:  IDX_LP → PUSH → VERT_LIST → POP
         # The single vertex at offsets[0] is the lamp position in model space.
-        if isinstance(current_parent, FltLightPoint):
+        lp_target = pending_lp_node if pending_lp_node is not None else (
+            current_parent if isinstance(current_parent, FltLightPoint) else None
+        )
+        if lp_target is not None:
             if offsets:
                 idx = self.vert_offset_map.get(offsets[0], None)
                 if idx is not None:
                     v = self.vert_palette[idx]
-                    current_parent.position = (v.x, v.y, v.z)
+                    lp_target.position = (v.x, v.y, v.z)
             return
 
         # Find the most recently added face in the current parent
