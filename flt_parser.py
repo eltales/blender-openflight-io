@@ -4,6 +4,7 @@ No bpy dependency; all data classes are plain Python objects.
 """
 
 import os
+import struct
 
 from .flt_reader import (
     FltReader,
@@ -155,7 +156,12 @@ class FltMeshNode(FltNode):
 class FltLightPoint(FltNode):
     def __init__(self, name=''):
         super().__init__(name)
-        self.node_type = 'LIGHTPOINT'
+        self.node_type  = 'LIGHTPOINT'
+        self.app_idx    = 0       # appearance palette index (op=128)
+        self.anim_idx   = 0       # animation palette index  (op=129)
+        self.draw_order = -1      # -1 = default
+        self.lp_flags   = 0xFFFF  # flags (0xFFFF = all bits set, common default)
+        self.position   = None    # (x, y, z) from vertex list — the 3D location of the light
 
 
 class FltUnhandled(FltNode):
@@ -185,6 +191,8 @@ class FltDatabase:
         self.mat_palette = {}           # dict {int: dict}
         self.children = []              # top-level scene nodes
         self.search_dirs = []
+        self.lp_app_palette_raw  = []   # list of (length, payload_bytes) for op=128 round-trip
+        self.lp_app_palette_list = []   # list of parsed dicts for Blender light import
 
         basedir = os.path.dirname(os.path.abspath(filepath))
         if basedir:
@@ -434,8 +442,20 @@ class FltDatabase:
             if op in (OP_LIGHT_POINT, OP_INDEXED_LP, OP_LIGHTPT_SYSTEM):
                 name = reader.read_string(8)
                 node = FltLightPoint(name)
+                if op == OP_INDEXED_LP and reader.length >= 28:
+                    node.app_idx    = reader.read_short()
+                    node.anim_idx   = reader.read_short()
+                    node.draw_order = reader.read_short()
+                    node.lp_flags   = reader.read_ushort()
                 add_child(node)
                 current_parent = node
+                continue
+
+            if op == OP_LIGHTPT_APP_PAL:
+                payload_len = reader.length - 4
+                raw_payload = reader.file.read(payload_len) if payload_len > 0 else b''
+                self.lp_app_palette_raw.append((reader.length, raw_payload))
+                self._parse_lp_app_palette_entry(raw_payload)
                 continue
 
             # All other records are silently ignored but hierarchy is preserved
@@ -770,6 +790,17 @@ class FltDatabase:
         num = (reader.length - 4) // 4
         offsets = [reader.read_int() for _ in range(num)]
 
+        # Light point: vertex list defines the 3D position of the light.
+        # In FLT the structure is:  IDX_LP → PUSH → VERT_LIST → POP
+        # The single vertex at offsets[0] is the lamp position in model space.
+        if isinstance(current_parent, FltLightPoint):
+            if offsets:
+                idx = self.vert_offset_map.get(offsets[0], None)
+                if idx is not None:
+                    v = self.vert_palette[idx]
+                    current_parent.position = (v.x, v.y, v.z)
+            return
+
         # Find the most recently added face in the current parent
         face = None
         if isinstance(current_parent, FltObject) and current_parent.faces:
@@ -791,6 +822,61 @@ class FltDatabase:
                 # Offset not found - leave a placeholder
                 face.vertex_indices.append(-1)
                 face.uv_list.append((0.0, 0.0))
+
+    # ── Light Point Appearance Palette parser ─────────────────────────────────
+
+    def _parse_lp_app_palette_entry(self, payload):
+        """Parse key fields from a Light Point Appearance Palette (op=128) payload.
+
+        Offset map (relative to payload start, i.e. after the 4-byte record header):
+          0    int32   index
+          4    char[256] name
+          260  int16   state (0=enabled)
+          262  int16   lp_type  (0=omni, 1=unidirectional, 2=bidirectional)
+          264  float   intensityFront
+          268  float   intensityBack
+          272  float   minDefocus
+          276  float   maxDefocus
+          280  int16   fadingMode
+          282  int16   fogPunchThrough
+          284  float   dirAmbIntensity
+          288  float   significance
+          292  int32   visibilityRange
+          296  float   fadeRangeRatio
+          300  float   fadeInDuration
+          304  float   fadeOutDuration
+          308  float   LOD1Range
+          312  float   LOD2Range
+          316  int16   primaryColor    ← FLT color palette index
+          318  int16   altColor
+          320  uint16  flags
+          322  int16   reserved (2 bytes padding to align subsequent floats)
+          324  float   minPixelSize
+          328  float   maxPixelSize
+          332  float   actualSize      ← visual size in DB units
+          336..361  (tp_* and fog_* fields, 26 bytes)
+          362  int16   direction
+          364  float   hLobeAngle      ← spot cone angle in degrees
+          368  float   vLobeAngle
+          372  float   rolloffExponent ← controls spot edge softness
+        """
+        entry = {}
+        try:
+            if len(payload) >= 336:
+                entry['index']          = struct.unpack_from('>i',  payload,   0)[0]
+                entry['name']           = payload[4:260].rstrip(b'\x00').decode('latin-1', 'replace')
+                entry['lp_type']        = struct.unpack_from('>h',  payload, 262)[0]
+                entry['intensity_front']= struct.unpack_from('>f',  payload, 264)[0]
+                entry['primary_color']  = struct.unpack_from('>h',  payload, 316)[0]
+                entry['actual_size']    = struct.unpack_from('>f',  payload, 332)[0]
+            if len(payload) >= 376:
+                entry['direction']      = struct.unpack_from('>h',  payload, 362)[0]
+                entry['h_lobe_angle']   = struct.unpack_from('>f',  payload, 364)[0]
+                entry['v_lobe_angle']   = struct.unpack_from('>f',  payload, 368)[0]
+                entry['rolloff_exp']    = struct.unpack_from('>f',  payload, 372)[0]
+        except Exception as e:
+            pass  # partial entry is still appended below
+        self.lp_app_palette_list.append(entry)
 
     # ── Mesh primitive conversion helpers ─────────────────────────────────────
 

@@ -13,13 +13,18 @@ Supported features:
 - Transform matrices (op=49)
 - LongID (op=33), Comment (op=31)
 - External references (op=63) with optional recursive import
+- Light Points (op=130) imported as Blender POINT/SPOT/AREA lights
+    - 3D position from vertex list (op=72)
+    - Light type, color, energy from Appearance Palette (op=128)
+    - Full round-trip: op=128 raw bytes preserved for lossless re-export
 - Export: Blender scene → FLT with full material/color/transparency round-trip
+- Export: Blender Light objects → FLT op=130 Indexed Light Points
 """
 
 bl_info = {
     "name": "OpenFlight FLT format",
     "author": "Aleksander Pininski (https://github.com/eltales), original: Greg MacDonald",
-    "version": (2, 2, 0),
+    "version": (2, 4, 0),
     "blender": (5, 0, 0),
     "location": "File > Import-Export > OpenFlight (.flt)",
     "description": "Import/Export OpenFlight (.flt) files with full material and hierarchy support",

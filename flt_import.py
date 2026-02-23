@@ -3,6 +3,9 @@ FLT Importer - converts FltDatabase data into a Blender 5.0.1 scene.
 """
 
 import os
+import math
+import base64
+import struct
 import traceback
 
 import bpy
@@ -68,6 +71,15 @@ class FltImporter:
         for node in self.db.children:
             self._import_node(node, root_col, parent_obj=None)
 
+        # Store Light Point Appearance Palette raw records (op=128) in scene
+        # custom property so they survive a save/reload and can be re-exported.
+        if self.db.lp_app_palette_raw:
+            entries = []
+            for (rec_len, payload) in self.db.lp_app_palette_raw:
+                raw = struct.pack('>hH', 128, rec_len) + payload
+                entries.append(base64.b64encode(raw).decode('ascii'))
+            scene['flt_lp_app_palette'] = entries
+
         bpy.context.view_layer.update()
 
     # ── Recursive node import ─────────────────────────────────────────────────
@@ -100,6 +112,14 @@ class FltImporter:
             )
 
         self._apply_matrix(obj, node.matrix)
+
+        # Light points: the 3D position is stored in a vertex-list child record
+        # (FLT structure: IDX_LP → PUSH → VERT_LIST → POP).  Apply it as the
+        # object's local translation so it lands at the lamp-head position.
+        if isinstance(node, FltLightPoint) and node.position is not None:
+            s = self.scale
+            x, y, z = node.position
+            obj.location = (x * s, y * s, z * s)
 
         for child in node.children:
             self._import_node(child, collection, obj)
@@ -186,9 +206,93 @@ class FltImporter:
     # ── FltLightPoint ─────────────────────────────────────────────────────────
 
     def _import_light_point(self, node, collection, parent_obj):
+        """Import a FLT Light Point as a Blender Light object.
+
+        If an Appearance Palette entry (op=128) is available for the node's
+        app_idx, we create a real POINT / SPOT / AREA light and map the key
+        FLT properties onto it.  Otherwise we fall back to an Empty so the
+        hierarchy is preserved.
+        """
         name = node.long_name or node.name or 'LightPoint'
-        obj = self._create_empty(name, collection, parent_obj)
-        obj['flt_type'] = 'LIGHTPOINT'
+
+        # Try to find a matching appearance palette entry
+        pal = None
+        if (hasattr(self.db, 'lp_app_palette_list') and
+                0 <= node.app_idx < len(self.db.lp_app_palette_list)):
+            pal = self.db.lp_app_palette_list[node.app_idx]
+
+        if pal:
+            obj = self._create_light_from_palette(name, pal, collection, parent_obj)
+        else:
+            obj = self._create_empty(name, collection, parent_obj)
+
+        # Save FLT metadata on the object for round-trip export
+        obj['flt_type']          = 'LIGHTPOINT'
+        obj['flt_lp_app_idx']    = int(node.app_idx)
+        obj['flt_lp_anim_idx']   = int(node.anim_idx)
+        obj['flt_lp_draw_order'] = int(node.draw_order)
+        obj['flt_lp_flags']      = int(node.lp_flags)
+        return obj
+
+    def _create_light_from_palette(self, name, pal, collection, parent_obj):
+        """Build a Blender Light object from a parsed FLT appearance palette dict.
+
+        FLT light type mapping:
+          0 (omni)          → POINT
+          1 (unidirectional)→ SPOT
+          2 (bidirectional) → AREA
+        """
+        # ── Light type ────────────────────────────────────────────────────────
+        lp_type = pal.get('lp_type', 0)
+        blender_type = {0: 'POINT', 1: 'SPOT', 2: 'AREA'}.get(lp_type, 'POINT')
+
+        light_data = bpy.data.lights.new(name=name, type=blender_type)
+
+        # ── Color (from FLT color palette lookup) ─────────────────────────────
+        primary_color_idx = pal.get('primary_color', 127)
+        try:
+            r, g, b, _ = self.db.lookup_color(primary_color_idx)
+        except Exception:
+            r, g, b = 1.0, 1.0, 1.0
+        # Clamp to valid range (lookup_color may return tiny values)
+        r = max(0.0, min(1.0, r if r > 0.001 else 1.0))
+        g = max(0.0, min(1.0, g if g > 0.001 else 1.0))
+        b = max(0.0, min(1.0, b if b > 0.001 else 1.0))
+        light_data.color = (r, g, b)
+
+        # ── Intensity → Blender energy (Watts) ────────────────────────────────
+        # FLT intensityFront is a dimensionless 0–1 multiplier with no direct
+        # physical equivalent in Blender.  Practical calibration for metric scenes:
+        #   Blender POINT at distance r gives  E = P / (4π·r²)  lux
+        #   For a street lamp at h=6 m, target ground illuminance ~20 lux:
+        #     P = 20 · 4π · 36 ≈ 9 000 W  → use 1 000 W as a conservative baseline.
+        # intensityFront=1.0 → 1 000 W  (scale in Blender if the scene needs it)
+        # intensityFront=0.0 → minimum 1 W so the object is still selectable
+        intensity = pal.get('intensity_front', 1.0)
+        light_data.energy = max(0.001, intensity) * 1000.0
+
+        # ── Radius ────────────────────────────────────────────────────────────
+        # FLT actualSize is the visual sprite size of the light-point glyph in
+        # FLT's rasterizer — it has nothing to do with Blender's physical
+        # emission radius (which controls soft-shadow penumbra size).
+        # Set radius = 0 so the import creates a true point light.
+        for attr in ('radius', 'shadow_soft_size'):
+            if hasattr(light_data, attr):
+                setattr(light_data, attr, 0.0)
+                break
+
+        # ── Spot-specific properties ──────────────────────────────────────────
+        if blender_type == 'SPOT':
+            h_lobe = pal.get('h_lobe_angle', 45.0)
+            rolloff = pal.get('rolloff_exp', 1.0)
+            # h_lobe_angle is in degrees (full cone angle assumed)
+            light_data.spot_size = math.radians(max(1.0, min(179.0, h_lobe)))
+            # rolloffExponent: higher = sharper edge → lower blend
+            light_data.spot_blend = min(1.0, max(0.0, 1.0 / max(0.1, rolloff)))
+
+        obj = bpy.data.objects.new(name, light_data)
+        collection.objects.link(obj)
+        self._set_parent(obj, parent_obj)
         return obj
 
     # ── FltMeshNode → Blender Mesh ────────────────────────────────────────────

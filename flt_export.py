@@ -6,6 +6,7 @@ Format: big-endian. Each record: int16 opcode + uint16 length (includes 4-byte h
 import os
 import math
 import struct
+import base64
 import traceback
 
 import bpy
@@ -27,9 +28,12 @@ OP_VERTEX_PALETTE  = 67
 OP_VERTEX_CNUV     = 70
 OP_VERTEX_LIST     = 72
 OP_MATERIAL        = 113
+OP_LIGHTPT_APP_PAL = 128
+OP_INDEXED_LP      = 130
 
 # ── Face misc_flags ────────────────────────────────────────────────────────────
 FACE_NOCOLOR     = 0x40000000   # color comes from material palette
+FACE_NO_ALT_COLOR = 0x20000000  # no alternate color (standard FLT convention)
 FACE_PACKEDCOLOR = 0x10000000   # color comes from packedColor field
 
 # ── Vertex flags ───────────────────────────────────────────────────────────────
@@ -148,6 +152,11 @@ class FltExporter:
         # Map from Blender material name to FLT material index
         self._mat_index_map = {}
 
+        # Light Point Appearance Palette (op=128) raw record bytes to write
+        self._lp_palette_raw_list = []
+        # Map from light object name → app_idx in _lp_palette_raw_list
+        self._lp_appidx_map = {}
+
     # ── Public ────────────────────────────────────────────────────────────
 
     def export(self):
@@ -157,6 +166,7 @@ class FltExporter:
             self._write_flt_header(w)
             self._write_color_palette(w)
             self._write_material_palette(w)
+            self._write_lp_app_palette(w)
             self._write_texture_palette(w)
             self._write_vertex_palette(w)
             self._write_scene(w)
@@ -164,10 +174,11 @@ class FltExporter:
     # ── Pass 1: build palettes ─────────────────────────────────────────────
 
     def _build_palettes(self):
-        """Collect all vertices, textures, and materials from all mesh objects."""
+        """Collect all vertices, textures, materials and LP palette data."""
         for obj in self.objects:
             if obj.type == 'MESH':
                 self._collect_from_mesh(obj)
+        self._collect_lp_palette()
 
     def _collect_from_mesh(self, obj):
         # Apply modifiers via evaluated depsgraph
@@ -221,6 +232,114 @@ class FltExporter:
                             self.tex_paths.append(path)
 
         obj_eval.to_mesh_clear()
+
+    # ── LP Appearance Palette collection ──────────────────────────────────
+
+    def _collect_lp_palette(self):
+        """Populate _lp_palette_raw_list and _lp_appidx_map.
+
+        Two strategies:
+        1. Round-trip: scene has 'flt_lp_app_palette' (list of base64 raw records
+           stored during import).  Use those bytes directly; each light object
+           already has its correct flt_lp_app_idx.
+        2. Synthesis: no scene property exists.  Build an op=128 record from
+           every LIGHT object that will be exported as a light point, assigning
+           sequential palette indices.
+        """
+        scene_palette = bpy.context.scene.get('flt_lp_app_palette', [])
+        if scene_palette:
+            # Strategy 1: use raw bytes from import
+            for entry_b64 in scene_palette:
+                try:
+                    self._lp_palette_raw_list.append(base64.b64decode(entry_b64))
+                except Exception:
+                    pass
+            # appIdx per object comes from flt_lp_app_idx custom property
+        else:
+            # Strategy 2: synthesize from LIGHT objects
+            for obj in self.objects:
+                if obj.type == 'LIGHT' or obj.get('flt_type') == 'LIGHTPOINT':
+                    if obj.type == 'LIGHT' and obj.name not in self._lp_appidx_map:
+                        idx = len(self._lp_palette_raw_list)
+                        self._lp_palette_raw_list.append(
+                            self._synth_lp_app_record(obj, idx)
+                        )
+                        self._lp_appidx_map[obj.name] = idx
+
+    def _synth_lp_app_record(self, obj, palette_index):
+        """Synthesize a complete 412-byte op=128 record from a Blender Light.
+
+        Payload layout (408 bytes, big-endian):
+          0    int32    index
+          4    char[256] name
+          260  int16    state (0=enabled)
+          262  int16    lp_type (0=omni, 1=uni, 2=bidi)
+          264  float    intensityFront
+          268  float    intensityBack (0)
+          272  float    minDefocus (0)
+          276  float    maxDefocus (0)
+          280  int16    fadingMode (0)
+          282  int16    fogPunch (0)
+          284  float    dirAmbIntensity (0)
+          288  float    significance (1)
+          292  int32    visibilityRange (0)
+          296  float    fadeRangeRatio (1)
+          300..315  floats: fadeIn/Out/LOD1/LOD2 (zeros)
+          316  int16    primaryColor (127=white)
+          318  int16    altColor (127)
+          320  uint16   flags (0)
+          322  int16    reserved (2 bytes padding)
+          324  float    minPixelSize (1)
+          328  float    maxPixelSize (100)
+          332  float    actualSize
+          336..361  (tp_*/fog_* fields, zeros)
+          362  int16    direction (0)
+          364  float    hLobeAngle
+          368  float    vLobeAngle
+          372  float    rolloffExponent
+          376..407  (anim/misc fields, zeros)
+        """
+        light = obj.data
+        lp_type = {'POINT': 0, 'SPOT': 1, 'AREA': 2, 'SUN': 0}.get(light.type, 0)
+
+        intensity  = light.energy / 1000.0   # inverse of import scale (import: × 1000)
+        # Blender radius is 0 for imported FLT lights (set intentionally).
+        # FLT actualSize is the sprite display size, so default to 0.3 m when
+        # the Blender radius is zero or unset.
+        radius_bl   = getattr(light, 'radius', 0.0) or getattr(light, 'shadow_soft_size', 0.0)
+        actual_size = (radius_bl if radius_bl > 0.0 else 0.3) / self.scale
+
+        h_lobe = 45.0
+        v_lobe = 45.0
+        rolloff = 1.0
+        if light.type == 'SPOT':
+            h_lobe = v_lobe = math.degrees(light.spot_size)
+            blend  = max(0.001, getattr(light, 'spot_blend', 0.15))
+            rolloff = 1.0 / blend
+
+        # Build 408-byte payload using struct.pack_into on a zero-filled bytearray
+        payload = bytearray(408)
+        name_enc = (obj.name[:255] + '\x00').encode('latin-1', 'replace')
+        struct.pack_into('>i',  payload,   0, palette_index)
+        payload[4:4 + min(len(name_enc), 256)] = name_enc[:256]
+        struct.pack_into('>h',  payload, 260, 0)              # state = enabled
+        struct.pack_into('>h',  payload, 262, lp_type)
+        struct.pack_into('>f',  payload, 264, intensity)
+        struct.pack_into('>f',  payload, 288, 1.0)            # significance
+        struct.pack_into('>f',  payload, 296, 1.0)            # fadeRangeRatio
+        struct.pack_into('>h',  payload, 316, 127)            # primaryColor = white
+        struct.pack_into('>h',  payload, 318, 127)            # altColor
+        struct.pack_into('>H',  payload, 320, 0)              # flags
+        # offset 322-323: reserved/padding (leave as zero)
+        struct.pack_into('>f',  payload, 324, 1.0)            # minPixelSize
+        struct.pack_into('>f',  payload, 328, 100.0)          # maxPixelSize
+        struct.pack_into('>f',  payload, 332, actual_size)
+        struct.pack_into('>h',  payload, 362, 0)              # direction
+        struct.pack_into('>f',  payload, 364, h_lobe)
+        struct.pack_into('>f',  payload, 368, v_lobe)
+        struct.pack_into('>f',  payload, 372, rolloff)
+
+        return struct.pack('>hH', OP_LIGHTPT_APP_PAL, 412) + bytes(payload)
 
     # ── Material extraction from Blender Principled BSDF ──────────────────
 
@@ -337,6 +456,18 @@ class FltExporter:
             w.float_(mat_data['alpha'])
             w.zeros(4)                     # spare
 
+    # ── Write: Light Point Appearance Palette (op=128) ────────────────────
+
+    def _write_lp_app_palette(self, w):
+        """Write Light Point Appearance Palette records (op=128).
+
+        _lp_palette_raw_list is built by _collect_lp_palette():
+        - Round-trip: raw bytes from scene['flt_lp_app_palette'] (set during import).
+        - Synthesis:  records synthesized from Blender LIGHT objects.
+        """
+        for raw in self._lp_palette_raw_list:
+            w.raw(raw)
+
     # ── Write: Texture Palette (op=64, 216 bytes each) ────────────────────
 
     def _write_texture_palette(self, w):
@@ -386,6 +517,8 @@ class FltExporter:
 
         if obj.type == 'MESH':
             self._write_object_node(w, obj, children)
+        elif obj.type == 'LIGHT' or obj.get('flt_type') == 'LIGHTPOINT':
+            self._write_light_point_node(w, obj, children)
         else:
             self._write_group_node(w, obj, children)
 
@@ -412,8 +545,9 @@ class FltExporter:
         w.float_(0.0)  # loopDuration
         w.float_(0.0)  # lastFrameDuration
 
-        if len(obj.name) > 8:
-            self._write_long_id(w, obj.name)
+        # Always write LongID — FLT convention: every node gets a LongID
+        # so that the full name is preserved on round-trip regardless of length.
+        self._write_long_id(w, obj.name)
 
         if children:
             w.rec(OP_PUSH, 4)
@@ -435,8 +569,8 @@ class FltExporter:
         w.short(0)     # significance
         w.ushort(0)    # reserved
 
-        if len(obj.name) > 8:
-            self._write_long_id(w, obj.name)
+        # Always write LongID — FLT convention: every node gets a LongID
+        self._write_long_id(w, obj.name)
 
         w.rec(OP_PUSH, 4)
         self._write_mesh_faces(w, obj)
@@ -551,7 +685,7 @@ class FltExporter:
         w.ushort(transparency)      # transparency
         w.uchar(0)                  # LODGenerationControl
         w.uchar(0)                  # lineStyleIndex
-        w.uint(FACE_PACKEDCOLOR)    # miscFlags: use packedColor
+        w.uint(FACE_PACKEDCOLOR | FACE_NO_ALT_COLOR)  # miscFlags
         w.uchar(0)                  # lightMode
         w.uchar(0)                  # reserved1
         w.ushort(0)                 # reserved2
@@ -562,6 +696,46 @@ class FltExporter:
         w.ushort(0)                 # reserved4
         w.uint(127)                 # primaryColorIndex
         w.uint(127)                 # alternateColorIndex
+
+    def _write_light_point_node(self, w, obj, children):
+        """Write an Indexed Light Point record (op=130, 28 bytes).
+
+        Record layout:
+          4  header (op=130 + length=28)
+          8  name
+          2  appIdx    (short)  — appearance palette index
+          2  animIdx   (short)  — animation palette index
+          2  drawOrder (short)  — -1 = default
+          2  flags     (ushort) — 0xFFFF = all flags set (standard default)
+          8  reserved  (zeros)
+        """
+        name       = obj.name[:8]
+        # For imported lights: flt_lp_app_idx is stored as a custom property.
+        # For native Blender lights: we synthesized a palette entry and stored
+        # its index in _lp_appidx_map during _collect_lp_palette().
+        if obj.get('flt_lp_app_idx') is not None:
+            app_idx = int(obj['flt_lp_app_idx'])
+        else:
+            app_idx = self._lp_appidx_map.get(obj.name, 0)
+        anim_idx   = int(obj.get('flt_lp_anim_idx',   0))
+        draw_order = int(obj.get('flt_lp_draw_order', -1))
+        lp_flags   = int(obj.get('flt_lp_flags',   0xFFFF))
+
+        w.rec(OP_INDEXED_LP, 28)
+        w.string(name, 8)
+        w.short(app_idx)
+        w.short(anim_idx)
+        w.short(draw_order)
+        w.ushort(lp_flags & 0xFFFF)
+        w.zeros(8)   # reserved
+
+        self._write_long_id(w, obj.name)
+
+        if children:
+            w.rec(OP_PUSH, 4)
+            for child in children:
+                self._write_node(w, child)
+            w.rec(OP_POP, 4)
 
     def _write_long_id(self, w, name):
         """Write a LongID record (op=33) for names longer than 8 chars."""
