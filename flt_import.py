@@ -345,7 +345,8 @@ class FltImporter:
         mesh.update()
 
         mat = self._get_or_create_material(
-            node.tex_index, node.mat_index, node.color, node.alpha
+            node.tex_index, node.mat_index, node.color, node.alpha,
+            double_sided=node.double_sided
         )
         if mat:
             mesh.materials.append(mat)
@@ -415,11 +416,13 @@ class FltImporter:
                 buvs.append(uv)
 
             mat_key = (fdata.tex_index, fdata.mat_index,
-                       fdata.color, round(fdata.alpha, 4))
+                       fdata.color, round(fdata.alpha, 4),
+                       fdata.double_sided)
             if mat_key not in mat_map:
                 mat = self._get_or_create_material(
                     fdata.tex_index, fdata.mat_index,
-                    fdata.color, fdata.alpha
+                    fdata.color, fdata.alpha,
+                    double_sided=fdata.double_sided
                 )
                 if mat:
                     mat_map[mat_key] = len(mats)
@@ -494,17 +497,23 @@ class FltImporter:
 
     # ── Material handling ─────────────────────────────────────────────────────
 
-    def _get_or_create_material(self, tex_index, mat_index, color, alpha):
+    def _get_or_create_material(self, tex_index, mat_index, color, alpha,
+                               double_sided=False):
         """Return a cached or newly created Principled BSDF material."""
         if not self.import_materials:
             return None
 
-        key = (tex_index, mat_index, color, round(alpha, 4))
+        key = (tex_index, mat_index, color, round(alpha, 4), double_sided)
         if key in self._mat_cache:
             return self._mat_cache[key]
 
         mat_name = self._build_mat_name(tex_index, mat_index)
         mat = bpy.data.materials.new(name=mat_name)
+        # Backface culling: FLT DrawType=1 means no backface culling (double-sided)
+        try:
+            mat.use_backface_culling = not double_sided
+        except AttributeError:
+            pass
         mat.use_nodes = True
 
         tree = mat.node_tree

@@ -65,6 +65,8 @@ class FltFaceData:
         self.mat_index = -1          # -1 = no material
         self.color = (1.0, 1.0, 1.0, 1.0)
         self.alpha = 1.0
+        # DrawType=1 (DrawSolidNoBackfaceCulling) → double-sided geometry.
+        # All other draw types render with backface culling (single-sided).
         self.double_sided = False
 
 
@@ -149,6 +151,7 @@ class FltMeshNode(FltNode):
         self.mat_index = -1
         self.alpha = 1.0
         self.color = (1.0, 1.0, 1.0, 1.0)
+        self.double_sided = False    # DrawType=1 → no backface culling
         self.lvp_verts = []      # list[FltVertex] from LocalVertexPool
         self.primitives = []     # list[FltMeshPrimData]
 
@@ -676,7 +679,8 @@ class FltDatabase:
         node = FltMeshNode(name)
         reader.read_int()       # irColorCode
         reader.read_short()     # relativePriority
-        reader.read_char()      # drawType
+        draw_type = reader.read_char()   # drawType
+        node.double_sided = (draw_type == 1)
         reader.read_uchar()     # textureWhite
         reader.read_ushort()    # colorNameIndex
         reader.read_ushort()    # alternateColorNameIndex
@@ -769,7 +773,8 @@ class FltDatabase:
         reader.skip(8)                   # face ID string (not needed)
         reader.read_uint()               # irColorCode
         reader.read_short()              # relativePriority
-        reader.read_char()               # drawType
+        draw_type = reader.read_char()   # drawType: 0=solid+cull, 1=solid+no-cull(double), ...
+        face.double_sided = (draw_type == 1)  # DrawSolidNoBackfaceCulling
         reader.read_uchar()              # textureWhite
         reader.read_ushort()             # colorNameIndex
         reader.read_ushort()             # alternateColorNameIndex

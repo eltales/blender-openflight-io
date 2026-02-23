@@ -632,11 +632,14 @@ class FltExporter:
             tex_idx = -1
             mat_idx = -1
             r, g, b, a = 1.0, 1.0, 1.0, 1.0
+            double_sided = False
 
             if poly.material_index < len(obj.data.materials):
                 mat = obj.data.materials[poly.material_index]
                 if mat is not None:
                     mat_idx = self._mat_index_map.get(mat.name, -1)
+                    # use_backface_culling=False means double-sided
+                    double_sided = not getattr(mat, 'use_backface_culling', True)
                     if mat.use_nodes:
                         for node in mat.node_tree.nodes:
                             if node.type == 'BSDF_PRINCIPLED':
@@ -670,7 +673,7 @@ class FltExporter:
                 continue
 
             # ── Write: Face → PUSH → VertexList → POP ────────────────────
-            self._write_face(w, tex_idx, mat_idx, r, g, b, a)
+            self._write_face(w, tex_idx, mat_idx, r, g, b, a, double_sided=double_sided)
 
             w.rec(OP_PUSH, 4)
 
@@ -683,7 +686,7 @@ class FltExporter:
 
         obj_eval.to_mesh_clear()
 
-    def _write_face(self, w, tex_idx, mat_idx, r, g, b, a):
+    def _write_face(self, w, tex_idx, mat_idx, r, g, b, a, double_sided=False):
         """Write a Face record (op=5, length=76).
 
         Color encoding:
@@ -696,15 +699,20 @@ class FltExporter:
         Transparency encoding:
           transparency = round((1 - alpha) * 65535)
           Parser reverses this: alpha = 1 - transparency / 65535
+
+        DrawType:
+          0 = DrawSolidWithBackfaceCulling (default)
+          1 = DrawSolidNoBackfaceCulling   (double-sided)
         """
         transparency = max(0, min(65535, round((1.0 - a) * 65535)))
         packed = self._pack_abgr(r, g, b, a)
+        draw_type = 1 if double_sided else 0
 
         w.rec(OP_FACE, 76)
         w.string('', 8)             # face ID
         w.int_(0)                   # irColorCode
         w.short(0)                  # relativePriority
-        w.char(0)                   # drawType = solid
+        w.char(draw_type)           # drawType: 0=solid+cull, 1=solid+no-cull
         w.uchar(0)                  # textureWhite
         w.ushort(127)               # colorNameIndex = white
         w.ushort(127)               # altColorNameIndex
