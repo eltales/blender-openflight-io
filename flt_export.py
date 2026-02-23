@@ -156,6 +156,8 @@ class FltExporter:
         self._lp_palette_raw_list = []
         # Map from light object name → app_idx in _lp_palette_raw_list
         self._lp_appidx_map = {}
+        # Map from light object name → vertex palette index (for 3D position)
+        self._lp_vertex_map = {}
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -178,6 +180,21 @@ class FltExporter:
         for obj in self.objects:
             if obj.type == 'MESH':
                 self._collect_from_mesh(obj)
+        # Collect vertex palette entries for light point 3D positions.
+        # Each LIGHT object gets one vertex (position only, dummy normal/UV).
+        for obj in self.objects:
+            if obj.type == 'LIGHT' or obj.get('flt_type') == 'LIGHTPOINT':
+                s = 1.0 / self.scale
+                loc = obj.matrix_world.translation
+                key = (
+                    round(loc.x * s, 6), round(loc.y * s, 6), round(loc.z * s, 6),
+                    0.0, 0.0, 1.0,  # dummy normal (Z-up)
+                    0.0, 0.0,       # no UV
+                )
+                if key not in self._vp_map:
+                    self._vp_map[key] = len(self.vp)
+                    self.vp.append(key)
+                self._lp_vertex_map[obj.name] = self._vp_map[key]
         self._collect_lp_palette()
 
     def _collect_from_mesh(self, obj):
@@ -559,8 +576,15 @@ class FltExporter:
         # so that the full name is preserved on round-trip regardless of length.
         self._write_long_id(w, obj.name)
 
-        if children:
+        # Write the light's 3D position and any children inside a PUSH/POP block.
+        # FLT importer expects: IDX_LP → PUSH → VERT_LIST [1 offset] → POP
+        vi = self._lp_vertex_map.get(obj.name)
+        if vi is not None or children:
             w.rec(OP_PUSH, 4)
+            if vi is not None:
+                # VERT_LIST: header(4) + 1 × int32 byte-offset(4) = 8 bytes total
+                w.rec(OP_VERTEX_LIST, 8)
+                w.int_(vert_byte_offset(vi))
             for child in children:
                 self._write_node(w, child)
             w.rec(OP_POP, 4)
@@ -741,8 +765,15 @@ class FltExporter:
 
         self._write_long_id(w, obj.name)
 
-        if children:
+        # Write the light's 3D position and any children inside a PUSH/POP block.
+        # FLT importer expects: IDX_LP → PUSH → VERT_LIST [1 offset] → POP
+        vi = self._lp_vertex_map.get(obj.name)
+        if vi is not None or children:
             w.rec(OP_PUSH, 4)
+            if vi is not None:
+                # VERT_LIST: header(4) + 1 × int32 byte-offset(4) = 8 bytes total
+                w.rec(OP_VERTEX_LIST, 8)
+                w.int_(vert_byte_offset(vi))
             for child in children:
                 self._write_node(w, child)
             w.rec(OP_POP, 4)
