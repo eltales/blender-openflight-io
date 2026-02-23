@@ -471,10 +471,20 @@ class FltExporter:
     # ── Write: Texture Palette (op=64, 216 bytes each) ────────────────────
 
     def _write_texture_palette(self, w):
+        flt_dir = os.path.dirname(os.path.abspath(self.filepath))
         for idx, path in enumerate(self.tex_paths):
-            basename = os.path.basename(path)
+            # Write a path relative to the output FLT file so that
+            # re-importing from any location can still resolve textures in
+            # subdirectories (e.g. ./Textures/name.rgb).
+            # Fall back to basename-only if relpath crosses drive roots (Windows).
+            try:
+                rel = os.path.relpath(path, flt_dir).replace(os.sep, '/')
+                if not rel.startswith('.') and not rel.startswith('/'):
+                    rel = './' + rel
+            except ValueError:
+                rel = os.path.basename(path)
             w.rec(OP_TEXTURE_PALETTE, 216)
-            w.string(basename, 200)
+            w.string(rel, 200)
             w.int_(idx)
             w.zeros(8)             # reserved x,y location
 
