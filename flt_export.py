@@ -21,12 +21,15 @@ OP_OBJECT          = 4
 OP_FACE            = 5
 OP_PUSH            = 10
 OP_POP             = 11
+OP_DOF             = 14
 OP_COLOR_PALETTE   = 32
 OP_LONG_ID         = 33
 OP_TEXTURE_PALETTE = 64
 OP_VERTEX_PALETTE  = 67
 OP_VERTEX_CNUV     = 70
 OP_VERTEX_LIST     = 72
+OP_LOD             = 73
+OP_SWITCH          = 96
 OP_MATERIAL        = 113
 OP_LIGHTPT_APP_PAL = 128
 OP_INDEXED_LP      = 130
@@ -541,11 +544,18 @@ class FltExporter:
     def _write_node(self, w, obj):
         """Recursively write one object and its children."""
         children = [o for o in self.objects if o.parent == obj]
+        flt_type = obj.get('flt_type', '')
 
         if obj.type == 'MESH':
             self._write_object_node(w, obj, children)
-        elif obj.type == 'LIGHT' or obj.get('flt_type') == 'LIGHTPOINT':
+        elif obj.type == 'LIGHT' or flt_type == 'LIGHTPOINT':
             self._write_light_point_node(w, obj, children)
+        elif flt_type == 'LOD':
+            self._write_lod_node(w, obj, children)
+        elif flt_type == 'DOF':
+            self._write_dof_node(w, obj, children)
+        elif flt_type == 'SWITCH':
+            self._write_switch_node(w, obj, children)
         else:
             self._write_group_node(w, obj, children)
 
@@ -612,6 +622,154 @@ class FltExporter:
             for child in children:
                 self._write_node(w, child)
         w.rec(OP_POP, 4)
+
+    def _write_lod_node(self, w, obj, children):
+        """Write a Level-of-Detail record (op=73, 80 bytes).
+
+        Layout (LOD.cs):
+          4  header
+          8  id
+          4  reserved
+          8  switch_in  (double)
+          8  switch_out (double)
+          2  specialEffectID1 (short)
+          2  specialEffectID2 (short)
+          4  flags (uint32)
+         24  center (3 × double)
+          8  transition_range (double)
+          8  significant_size (double)
+        Total = 4+8+4+8+8+2+2+4+24+8+8 = 80 bytes
+        """
+        name           = obj.name[:8]
+        switch_in      = float(obj.get('flt_switch_in', 0.0))
+        switch_out     = float(obj.get('flt_switch_out', 0.0))
+        flags          = int(obj.get('flt_lod_flags', 0))
+        center         = obj.get('flt_lod_center', [0.0, 0.0, 0.0])
+        trans_range    = float(obj.get('flt_lod_transition_range', 0.0))
+        sig_size       = float(obj.get('flt_lod_significant_size', 0.0))
+
+        w.rec(OP_LOD, 80)
+        w.string(name, 8)
+        w.uint(0)                    # reserved
+        w.double(switch_in)
+        w.double(switch_out)
+        w.short(0)                   # specialEffectID1
+        w.short(0)                   # specialEffectID2
+        w.uint(flags)
+        w.double(float(center[0]) if len(center) > 0 else 0.0)
+        w.double(float(center[1]) if len(center) > 1 else 0.0)
+        w.double(float(center[2]) if len(center) > 2 else 0.0)
+        w.double(trans_range)
+        w.double(sig_size)
+
+        self._write_long_id(w, obj.name)
+
+        if children:
+            w.rec(OP_PUSH, 4)
+            for child in children:
+                self._write_node(w, child)
+            w.rec(OP_POP, 4)
+
+    def _write_dof_node(self, w, obj, children):
+        """Write a Degree-of-Freedom record (op=14, 380 bytes).
+
+        Layout (DOF.cs):
+          4  header
+          8  id
+          4  reserved
+         24  origin           (3 × double)
+         24  point_on_x_axis  (3 × double)
+         24  point_in_xy_plane(3 × double)
+          9 × 32  per-axis limits (min, max, cur, inc × double):
+                  Z, Y, X, Pitch, Roll, Yaw, ScaleZ, ScaleY, ScaleX
+          4  flags (uint32)
+        Total = 4+8+4+72+288+4 = 380 bytes
+        """
+        name = obj.name[:8]
+        flags = int(obj.get('flt_dof_flags', 0))
+
+        def _get3(key):
+            v = obj.get(key, [0.0, 0.0, 0.0])
+            return (float(v[0]) if len(v) > 0 else 0.0,
+                    float(v[1]) if len(v) > 1 else 0.0,
+                    float(v[2]) if len(v) > 2 else 0.0)
+
+        def _get4(key):
+            v = obj.get(key, [0.0, 0.0, 0.0, 0.0])
+            return (float(v[0]) if len(v) > 0 else 0.0,
+                    float(v[1]) if len(v) > 1 else 0.0,
+                    float(v[2]) if len(v) > 2 else 0.0,
+                    float(v[3]) if len(v) > 3 else 0.0)
+
+        origin    = _get3('flt_dof_origin')
+        pt_x      = _get3('flt_dof_point_on_x_axis')
+        pt_xy     = _get3('flt_dof_point_in_xy_plane')
+        lim_x     = _get4('flt_dof_limits_x')
+        lim_y     = _get4('flt_dof_limits_y')
+        lim_z     = _get4('flt_dof_limits_z')
+        lim_p     = _get4('flt_dof_limits_pitch')
+        lim_r     = _get4('flt_dof_limits_roll')
+        lim_yw    = _get4('flt_dof_limits_yaw')
+        lim_sx    = _get4('flt_dof_limits_scale_x')
+        lim_sy    = _get4('flt_dof_limits_scale_y')
+        lim_sz    = _get4('flt_dof_limits_scale_z')
+
+        w.rec(OP_DOF, 380)
+        w.string(name, 8)
+        w.uint(0)                    # reserved
+        # Coordinate triples
+        for val in (*origin, *pt_x, *pt_xy):
+            w.double(val)
+        # Per-axis limits — file order: Z, Y, X, Pitch, Roll, Yaw, ScaleZ, ScaleY, ScaleX
+        for lim in (lim_z, lim_y, lim_x, lim_p, lim_r, lim_yw, lim_sz, lim_sy, lim_sx):
+            for val in lim:
+                w.double(val)
+        w.uint(flags)
+
+        self._write_long_id(w, obj.name)
+
+        if children:
+            w.rec(OP_PUSH, 4)
+            for child in children:
+                self._write_node(w, child)
+            w.rec(OP_POP, 4)
+
+    def _write_switch_node(self, w, obj, children):
+        """Write a Switch record (op=96).
+
+        Layout:
+          4  header
+          8  id
+          4  reserved
+          4  current_mask (uint32)
+          4  num_masks    (uint32)
+          4  num_u32_per_mask (uint32)
+          N  masks: num_masks × num_u32_per_mask × uint32
+        Total = 4 + 8+4+4+4+4 + N*4 = 28 + N*4 bytes
+        """
+        name         = obj.name[:8]
+        current_mask = int(obj.get('flt_current_mask', 0))
+        # Masks are not stored as a single custom prop; default to one mask = current
+        # A proper round-trip would need to store and restore the full mask array.
+        num_masks    = 1
+        n_per_mask   = 1
+        total_len    = 28 + num_masks * n_per_mask * 4  # = 32
+
+        w.rec(OP_SWITCH, total_len)
+        w.string(name, 8)
+        w.uint(0)             # reserved
+        w.uint(current_mask)
+        w.uint(num_masks)
+        w.uint(n_per_mask)
+        w.uint(current_mask)  # the single mask value
+
+        self._write_long_id(w, obj.name)
+
+        if children:
+            w.rec(OP_PUSH, 4)
+            for child in children:
+                self._write_node(w, child)
+            w.rec(OP_POP, 4)
 
     def _write_mesh_faces(self, w, obj):
         """Write Face + PUSH + VertexList + POP for each polygon of a mesh object."""

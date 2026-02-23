@@ -147,9 +147,13 @@ class FltImporter:
     def _import_lod(self, node, collection, parent_obj):
         name = node.long_name or node.name or 'LOD'
         obj = self._create_empty(name, collection, parent_obj)
-        obj['flt_type'] = 'LOD'
-        obj['flt_switch_in'] = node.switch_in
-        obj['flt_switch_out'] = node.switch_out
+        obj['flt_type']               = 'LOD'
+        obj['flt_switch_in']          = node.switch_in
+        obj['flt_switch_out']         = node.switch_out
+        obj['flt_lod_flags']          = int(node.flags)
+        obj['flt_lod_center']         = list(node.center)
+        obj['flt_lod_transition_range'] = node.transition_range
+        obj['flt_lod_significant_size'] = node.significant_size
         return obj
 
     # ── FltSwitch ─────────────────────────────────────────────────────────────
@@ -166,9 +170,21 @@ class FltImporter:
     def _import_dof(self, node, collection, parent_obj):
         name = node.long_name or node.name or 'DOF'
         obj = self._create_empty(name, collection, parent_obj)
-        obj['flt_type'] = 'DOF'
-        if 'origin' in node.limits:
-            obj['flt_origin'] = list(node.limits['origin'])
+        obj['flt_type']                = 'DOF'
+        obj['flt_dof_origin']          = list(node.origin)
+        obj['flt_dof_point_on_x_axis'] = list(node.point_on_x_axis)
+        obj['flt_dof_point_in_xy_plane'] = list(node.point_in_xy_plane)
+        obj['flt_dof_flags']           = int(node.dof_flags)
+        # Per-axis limits: (min, max, current, increment) as float lists
+        obj['flt_dof_limits_x']       = list(node.limits_x)
+        obj['flt_dof_limits_y']       = list(node.limits_y)
+        obj['flt_dof_limits_z']       = list(node.limits_z)
+        obj['flt_dof_limits_pitch']   = list(node.limits_pitch)
+        obj['flt_dof_limits_roll']    = list(node.limits_roll)
+        obj['flt_dof_limits_yaw']     = list(node.limits_yaw)
+        obj['flt_dof_limits_scale_x'] = list(node.limits_scale_x)
+        obj['flt_dof_limits_scale_y'] = list(node.limits_scale_y)
+        obj['flt_dof_limits_scale_z'] = list(node.limits_scale_z)
         return obj
 
     # ── FltExtRef ─────────────────────────────────────────────────────────────

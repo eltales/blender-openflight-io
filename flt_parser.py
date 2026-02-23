@@ -115,6 +115,8 @@ class FltLOD(FltNode):
         self.switch_out = 0.0
         self.center = (0.0, 0.0, 0.0)
         self.flags = 0
+        self.transition_range = 0.0   # LOD.cs: TransitionRange (smoothing blend range)
+        self.significant_size = 0.0   # LOD.cs: SignificantSize (for range auto-calculation)
 
 
 class FltSwitch(FltNode):
@@ -131,7 +133,24 @@ class FltDOF(FltNode):
     def __init__(self, name=''):
         super().__init__(name)
         self.node_type = 'DOF'
-        self.limits = {}      # dict with 'origin' etc.
+        # DOF.cs field layout (all coordinate triples are (x, y, z) doubles):
+        self.origin          = (0.0, 0.0, 0.0)  # origin of local coordinate system
+        self.point_on_x_axis = (0.0, 0.0, 0.0)  # point on X axis
+        self.point_in_xy_plane = (0.0, 0.0, 0.0) # point in XY plane
+        # Per-axis limits as (min, max, current, increment) tuples of doubles.
+        # Axis order in file: Z, Y, X, Pitch, Roll, Yaw, ScaleZ, ScaleY, ScaleX
+        self.limits_x       = (0.0, 0.0, 0.0, 0.0)
+        self.limits_y       = (0.0, 0.0, 0.0, 0.0)
+        self.limits_z       = (0.0, 0.0, 0.0, 0.0)
+        self.limits_pitch   = (0.0, 0.0, 0.0, 0.0)
+        self.limits_roll    = (0.0, 0.0, 0.0, 0.0)
+        self.limits_yaw     = (0.0, 0.0, 0.0, 0.0)
+        self.limits_scale_x = (0.0, 0.0, 0.0, 0.0)
+        self.limits_scale_y = (0.0, 0.0, 0.0, 0.0)
+        self.limits_scale_z = (0.0, 0.0, 0.0, 0.0)
+        self.dof_flags      = 0   # uint32 — bits 0-8 indicate which axes are limited
+        # Legacy alias kept for compatibility with old import code
+        self.limits = {}
 
 
 class FltExtRef(FltNode):
@@ -637,6 +656,8 @@ class FltDatabase:
         cy = reader.read_double()
         cz = reader.read_double()
         node.center = (cx, cy, cz)
+        node.transition_range = reader.read_double()   # LOD.cs: TransitionRange
+        node.significant_size = reader.read_double()   # LOD.cs: SignificantSize
         return node
 
     def _parse_switch(self, reader):
@@ -652,13 +673,55 @@ class FltDatabase:
         return node
 
     def _parse_dof(self, reader):
+        """Parse DOF (op=14) record.
+
+        Layout (DOF.cs parse order, all big-endian):
+          8   id (char[8])
+          4   reserved
+         24   origin           (3 × double)
+         24   point_on_x_axis  (3 × double)
+         24   point_in_xy_plane(3 × double)
+         32   limits_z (min, max, cur, inc × double)
+         32   limits_y
+         32   limits_x
+         32   limits_pitch
+         32   limits_roll
+         32   limits_yaw
+         32   limits_scale_z
+         32   limits_scale_y
+         32   limits_scale_x
+          4   flags (uint32)
+        Total data = 8+4+72+288+4 = 376 bytes → record = 380 bytes
+        """
         name = reader.read_string(8)
         node = FltDOF(name)
         reader.read_uint()                    # reserved
-        ox = reader.read_double()
-        oy = reader.read_double()
-        oz = reader.read_double()
-        node.limits['origin'] = (ox, oy, oz)
+
+        def _rd3():
+            return (reader.read_double(), reader.read_double(), reader.read_double())
+
+        def _rd4():
+            return (reader.read_double(), reader.read_double(),
+                    reader.read_double(), reader.read_double())
+
+        node.origin           = _rd3()
+        node.point_on_x_axis  = _rd3()
+        node.point_in_xy_plane = _rd3()
+
+        # File order: Z, Y, X, Pitch, Roll, Yaw, ScaleZ, ScaleY, ScaleX
+        node.limits_z       = _rd4()
+        node.limits_y       = _rd4()
+        node.limits_x       = _rd4()
+        node.limits_pitch   = _rd4()
+        node.limits_roll    = _rd4()
+        node.limits_yaw     = _rd4()
+        node.limits_scale_z = _rd4()
+        node.limits_scale_y = _rd4()
+        node.limits_scale_x = _rd4()
+        node.dof_flags      = reader.read_uint()
+
+        # Legacy compat: keep limits['origin'] for old import code
+        node.limits['origin'] = node.origin
         return node
 
     def _parse_external_ref(self, reader):
